@@ -1,0 +1,380 @@
+---
+title: "Dwyer Lab Thesis Code"
+author: "Jacob Feingold"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+require(tidyverse)
+require(timetk)
+require(zoo)
+```
+
+
+## Biological Background
+
+The Douglas-Fir Tussock Moth (Orgyia pseudotsugata, DFTM) is an insect pest and defoliator that causes damage to interior dry-belt forests of the Western US and Canada, preying primarily on Douglas-fir, grand fir, and white fir. These moths experience large-scale, long-term population cycles on the order of 7-10 years. These cycles are driven primarily by interaction with a pathogen that affects larvae (caterpillars) of the DFTM. Predicting the location and timing of DFTM outbreaks is of great importance to the USDA forest service so that they can streamline methods of controlling DFTM populations, often through release of artifical pathogens. With the long-term goal of being able to predict the location and timing of DFTM outbreaks, our short-term goal is to quantitatively define populations within the full range of DFTM in the US and Canada.
+
+
+
+
+## The Data
+
+Raw data consists of QGIS shape files delineating the area defoliated by the DFTM from 1947-2019. Data was collected by the USDA forest service by doing flyovers of the Western US and Canada and recording (either by hand-drawn maps in the early days or digital cameras in the modern day) area defoliated. Data from before 1990 was excluded due to the unreliability of hand-drawn maps. Additionally digitized data from before 1990 was very sparse in the data set, largely due to a backlog of undigitized hand-drawn maps from this time period. In the future, we may go back and digitize data from pdfs of maps that the Dwyer Lab possesses from 1947-1989 to see if our results hold up. The data set that was used for our analysis consists of 5454 individual polygons of defoliation, each of which has a year of observation, an area of defoliation, and a serial number (polygon ID), as well as other attributes that were not relevant to our analysis. Before processing and analysis, K-means clustering was run in QGIS at 24 different levels ranging from 3 clusters to 499 clusters. Thus, in addition to survey year, area, and ID, each polygon also has 24 different distances associated with it, each representing the distance from the centroid of the polygon to the mean coordinate (weighted by area) of its cluster at a specific clustering level (referred to as a "hubline"). The first chunk below reads in the raw data sets of the hublines for each clustering level and the raw data of of each polygon and combines them into a "long" data frame with one entry for each polygon at each clustering level. The second chunk takes this data and conglomerates polygons by their cluster and year at each level, producing a long data frame where each entry represents one cluster at a given year in the time series at a given clustering level, and records metrics such as total defoliation area, radial distance (an alternative measure of total defoliation), scattering distance (a measure of dispersion of polygons), and the number of individual polygons in that cluster at that year, as well as assigning a "year of outbreak" to each year in the data set and an outbreak serial number for each individual outbreak. The length of this data frame is given by [the number of years in the survey period (29) times the number of clusters at the given level] summed over all the clustering levels. This data frame allows us to track cluster-specific metrics of defoliation over time for each cluster and each clustering level. Included in this pipeline is some exploration of the autocorrelation of radial distance over time within a cluster. This work was necessary for determining how many years of zero defoliation could be observed between two years of non-zero defoliation while still defining the period as part of an uninterrupted outbreak. Plots are included, and our conclusion was that up to 1 year of zero defoliation between 2 years of non-zero defoliation was acceptable for defining individual outbreaks.
+
+
+
+```{r}
+setwd("~/Downloads/for office mac from personal mac_ 9-20-21/")
+
+###using iterative joining to create a long data frame of all the hublines (one entry for each polygon except in cases where there is only one polygon in a given cluster, these data points are not present in the hublines csvs because they do not have a hubline length)
+file_list <- c("M3", "M4", "M5", "M7", "M8", "M10", "M13", "M16", "M20", "M25", "M31", "M38", "M47", "M59", "M73", "M90", "M112", "M139", "M172", "M213", "M263", "M326", "M404", "M499")
+lvl_M_list <- c(3, 4, 5, 7, 8, 10, 13, 16, 20, 25, 31, 38, 47, 59, 73, 90, 112, 139, 172, 213, 263, 326, 404, 499)
+
+hublines_allM_long <- tibble()
+
+for (i in 1:length(file_list)) {
+  tmp_defol<-read_csv(paste0("./Cluster analysis/dissolved/clusters_dispersal.gdb/hublines_clusters_csvs/hublines_clusters_",file_list[i],"_area4_geom.csv")) %>%
+    filter(SURVEY_YR>1989)
+  colnames(tmp_defol)[3]<- paste0("CLUSTER_ID")
+  tmp_defol<- tmp_defol %>%
+    arrange(CLUSTER_ID, SURVEY_YR) %>%
+    mutate(lvl_M=lvl_M_list[i])
+  hublines_allM_long<-bind_rows(hublines_allM_long, tmp_defol)
+}
+
+hublines_allM_long <- hublines_allM_long %>%
+  select(CLUSTER_ID, SURVEY_YR, length, ID, area4, lvl_M)
+
+##creating a long data frame of all the polygons
+polygons_allCIDS_wide <- read_csv("./Cluster analysis/dissolved/clusters_dispersal.gdb/102039_centroids_allCIDs_dissolved_byyear_area4.csv") %>%
+  filter(SURVEY_YR >1989) %>%
+  mutate(inv_area = 1/area4)
+
+polygons_allCIDs_long <- polygons_allCIDS_wide %>%
+  select(SURVEY_YR, CID_M3, CID_M4, CID_M5, CID_M7, CID_M8, CID_M10, CID_M13, CID_M16, CID_M20, CID_M25, CID_M31, CID_M38, CID_M47, CID_M59, CID_M73, CID_M90, CID_M112, CID_M139, CID_M172, CID_M213, CID_M263, CID_M326, CID_M404, CID_M499, ID, area4, inv_area) %>%
+  gather(key = "grp_name", value = "CLUSTER_ID", -SURVEY_YR, -ID, -area4, -inv_area) %>%
+  mutate(lvl_M = as.numeric(substr(grp_name, 6, nchar(grp_name))))
+
+
+
+###joining the two long data frames together (this step is necessary because as stated before, the hublines data sets do not represent every polygon because of what happens when there is only one polygon in a cluster, so the hublines data must be joined to the full polygons data)
+hublines_allM_long_formatted <- hublines_allM_long %>%
+  select(ID, lvl_M, length)
+
+polygons_allCIDs_long <- polygons_allCIDs_long %>%
+  left_join(hublines_allM_long_formatted, by = c("ID", "lvl_M")) %>%
+  mutate(weighted_dist=length/area4)
+
+polygons_allCIDs_long$length[is.na(polygons_allCIDs_long$length)]<-0
+```
+
+Pipeline for cleaning and processing the data below:
+
+```{r}
+##calculating "final defol data" for the entire polygons set at once
+defol_summary <- polygons_allCIDs_long %>%
+  group_by(lvl_M, CLUSTER_ID, SURVEY_YR) %>%
+  dplyr::summarise(n_pol = n(),
+            defol_total = sum(area4),
+            rad_dist= sqrt(sum(area4)/pi),
+            scat_dist_base = (pi*rad_dist^2)*mean(weighted_dist),
+            scat_dist_mod = scat_dist_base/sum(inv_area)) %>%
+  arrange(lvl_M,  CLUSTER_ID, SURVEY_YR) %>%
+  ungroup()
+
+
+##adding in years with 0 defoliation to complete the time series
+
+defol_summary_complete <- tibble()
+start <- 1991
+finish <- 2019
+
+for (i in 1:length(lvl_M_list)) {
+  tmp_defol <- defol_summary %>%
+    filter(lvl_M == lvl_M_list[i])
+  cluster_ids<-unique(tmp_defol$CLUSTER_ID)
+  nclusters<-length(cluster_ids)
+  all <- tibble(lvl_M=lvl_M_list[i], CLUSTER_ID=sort(rep((cluster_ids),finish-start+1)),
+                SURVEY_YR=rep((start:finish),nclusters))
+  
+  tmp_defol<-full_join(tmp_defol,all,by=c("lvl_M","SURVEY_YR","CLUSTER_ID")) %>%
+    dplyr::mutate(n_pol=ifelse(is.na(n_pol),0,n_pol), 
+           defol_total=ifelse(is.na(defol_total),0,defol_total), 
+           rad_dist=ifelse(is.na(rad_dist),0,rad_dist), 
+           scat_dist_base=ifelse(is.na(scat_dist_base),0,scat_dist_base), 
+           scat_dist_mod=ifelse(is.na(scat_dist_mod),0,scat_dist_mod))
+  
+  defol_summary_complete <- bind_rows(defol_summary_complete, tmp_defol)
+  
+}
+
+defol_summary_complete <- defol_summary_complete %>%
+  arrange(lvl_M,  CLUSTER_ID, SURVEY_YR)
+
+
+
+###adding delta R and delta S
+defol_summary_complete <- defol_summary_complete %>%
+  group_by(lvl_M, CLUSTER_ID) %>%
+  dplyr::mutate(delta_rad=ifelse(is.na(lag(rad_dist, default=NA)), 0, rad_dist-lag(rad_dist, default = 0)), 
+         delta_scat_base=ifelse(is.na(lag(scat_dist_base, default=NA)),0, scat_dist_base-lag(scat_dist_base, default = 0)),
+         delta_scat_mod = ifelse(is.na(lag(scat_dist_mod, default=NA)),0, scat_dist_mod-lag(scat_dist_mod, default = 0))) %>%
+  ungroup()
+
+
+
+###assigning year of outbreak and outbreak IDs
+
+##looking at autocorrelation within each grouping level to determine cutoff for number of zeros in a row that determines when an outbreak has ended
+defol_summary_complete <- defol_summary_complete %>%
+  dplyr::mutate(yr_as_date=as.Date(SURVEY_YR-1990, origin = "1991-01-01")) ##this date doesn't actually mean anything, it's just so that we can feed it into tk_acf_diagnostics
+
+
+acf_table <- tibble()
+
+for (i in 1:length(lvl_M_list)) {
+  acf_tmp<-defol_summary_complete %>%
+    filter(lvl_M == lvl_M_list[i]) %>%
+    group_by(CLUSTER_ID) %>%
+    arrange(yr_as_date) %>%
+    tk_acf_diagnostics(yr_as_date, rad_dist, .lags = 28) %>%
+    dplyr::mutate(signif_onezero = ifelse(ACF > .white_noise_lower & ACF < .white_noise_upper, 0, 1), lvl_M = lvl_M_list[i]) %>%
+    ungroup()
+  
+  acf_table <- bind_rows(acf_table, acf_tmp)
+}
+
+acf_summary <- acf_table %>%
+  group_by(lvl_M, lag) %>%
+  dplyr::summarise(pct_signif = mean(signif_onezero))
+
+##plotting acfs as a function of lag, colored by lvl_M
+acf_table %>%
+  ggplot() +
+  aes(x = lag, y = ACF, color = lvl_M) +
+  ggtitle("Auto-Correlation vs Lag") +
+  geom_point() +
+  geom_hline(yintercept = unique(acf_table$.white_noise_upper)) +
+  geom_hline(yintercept = unique(acf_table$.white_noise_lower)) +
+  scale_color_viridis_c()
+
+
+acf_summary %>%
+  ggplot() +
+  aes(x = lag, y = pct_signif, color = lvl_M, group = lvl_M) +
+  ggtitle("% of significant ACF values vs Lag") +
+  ylab("% of significant ACF values") +
+  geom_line() +
+  geom_point()+
+  scale_color_viridis_c()
+
+
+###conclusion: no more than 1 zero in a row is tolerated for defining a continuous outbreak
+
+
+defol_summary_complete_outbrkyrs <- tibble()
+
+for (i in 1:length(lvl_M_list)) { ##this loop assigns each cell in defol_summary_complete a yr_of_outbreak value
+  
+  tmp_defol <- defol_summary_complete %>%
+    filter(lvl_M == lvl_M_list[i])
+  
+  for (i in 1:length(unique(tmp_defol$CLUSTER_ID))) {  
+    
+    filtered <- tmp_defol %>%
+      filter(CLUSTER_ID == unique(tmp_defol$CLUSTER_ID)[i]) %>%
+      mutate(yr_of_outbreak = 0)
+    
+    for (j in 1:length(filtered$CLUSTER_ID)) {
+      if (j==1) {
+        filtered$yr_of_outbreak[j] <- ifelse(filtered$rad_dist[j] != 0, 1, 0)
+      }
+      
+      if (j==2) {
+        if (filtered$yr_of_outbreak[j-1] != 0) {
+          if (filtered$rad_dist[j]==0) {
+            if (filtered$rad_dist[j+1] ==0) {
+              filtered$yr_of_outbreak[j] <- 0
+            }
+            if (filtered$rad_dist[j+1] != 0) {
+              filtered$yr_of_outbreak[j] <- filtered$yr_of_outbreak[j-1] + 1
+            }
+          }
+          if (filtered$rad_dist[j] != 0) {
+            filtered$yr_of_outbreak[j] <- filtered$yr_of_outbreak[j-1] + 1
+          }
+        }
+        if (filtered$yr_of_outbreak[j-1] == 0) {
+          if (filtered$rad_dist[j] == 0) {
+            filtered$yr_of_outbreak[j] <- 0
+          }
+          if (filtered$rad_dist[j] != 0) {
+            filtered$yr_of_outbreak[j] <- 1
+          }
+        }
+      }
+      
+      if (j != 2 & j != 1 & j != 29) {
+        if (filtered$rad_dist[j-2] == 0 & filtered$rad_dist[j-1] == 0) {
+          if (filtered$rad_dist[j] == 0) {
+            filtered$yr_of_outbreak[j] <- 0
+          }
+          if (filtered$rad_dist[j] != 0) {
+            filtered$yr_of_outbreak[j] <- 1
+          }
+        }
+        if (filtered$yr_of_outbreak[j-1] != 0) {
+          if (filtered$rad_dist[j] != 0) {
+            filtered$yr_of_outbreak[j] <- filtered$yr_of_outbreak[j-1] + 1
+          }
+          if (filtered$rad_dist[j] == 0) {
+            if (filtered$rad_dist[j+1] == 0) {
+              filtered$yr_of_outbreak[j] <- 0
+            }
+            if (filtered$rad_dist[j+1] != 0) {
+              filtered$yr_of_outbreak[j] <- filtered$yr_of_outbreak[j-1] + 1
+            }
+          }
+        }
+      }
+      if (j == 29) {
+        if (filtered$yr_of_outbreak[j-1] != 0) {
+          if (filtered$rad_dist[j] == 0) {
+            filtered$yr_of_outbreak[j] <- 0
+          }
+          if (filtered$rad_dist[j] != 0) {
+            filtered$yr_of_outbreak[j] <- filtered$yr_of_outbreak[j-1] + 1
+          }
+        }
+        if (filtered$yr_of_outbreak[j-1] == 0) {
+          if (filtered$rad_dist[j] == 0) {
+            filtered$yr_of_outbreak[j] <- 0
+          }
+          if (filtered$rad_dist[j] != 0) {
+            filtered$yr_of_outbreak[j] <- 1
+          }
+        }
+      }
+    }
+    
+    defol_summary_complete_outbrkyrs <-  bind_rows(defol_summary_complete_outbrkyrs, filtered) 
+    
+    
+  }
+  
+}
+
+
+###assigning outbreak IDs for individual outbreaks
+defol_summary_complete_outbreakIDs <- tibble()
+
+for (i in 1:length(lvl_M_list)) {
+  tmp_defol <- defol_summary_complete_outbrkyrs %>%
+    filter(lvl_M == lvl_M_list[i])
+  
+  filtered <- tmp_defol %>%
+    filter(yr_of_outbreak == 1) %>%
+    mutate(outbreak_ID = 0)
+  
+  for (j in 1:length(filtered$yr_of_outbreak)) {
+    filtered$outbreak_ID[j] <- j
+  }
+  
+  filtered <- filtered %>%
+    select(lvl_M, CLUSTER_ID, SURVEY_YR, yr_of_outbreak, outbreak_ID)
+  
+  tmp_defol <- tmp_defol %>%
+    left_join(filtered, by = c("lvl_M", "CLUSTER_ID", "yr_of_outbreak", "SURVEY_YR"))
+  
+  defol_summary_complete_outbreakIDs <- defol_summary_complete_outbreakIDs %>%
+    bind_rows(tmp_defol)
+  
+}
+
+
+defol_summary_complete_outbreakIDs$outbreak_ID[1]<-0
+defol_summary_complete_outbreakIDs$outbreak_ID<-na.locf(defol_summary_complete_outbreakIDs$outbreak_ID)
+
+defol_summary_complete_outbreakIDs <- defol_summary_complete_outbreakIDs %>%
+  mutate(outbreak_ID_final = ifelse(yr_of_outbreak == 0, 0, outbreak_ID)) %>%
+  select(-outbreak_ID)
+
+
+```
+
+## Methods
+
+
+Now that we have the data in the form that we need, we can use it to answer the question of "which clustering level provides the best spatial scale for observing synchronous outbreak regions?". To do this, we need to understand the phenomena of merging and splitting. Merging is a process that occurs when we have to few clusters compared to the theoretical ideal number (i.e. the clustering level at which we best preserve synchronous outbreak regions). Say that at our ideal clustering level, a given cluster A has two distinct outbreaks of defoliation. At that same level, cluster B has a single outbreak, the start and end of which overlap with end and start, respectively, of the two outbreaks in cluster A. If we reduce the number of clusters from our ideal number, cluster A and cluster B might collapse into one, and the overlap of cluster B's outbreak with the outbreaks in cluster A will mask their distinctness, and the new cluster [A,B] will appear to have only one outbreak. Looking across all the clusters at this reduced number of clusters, we will see a high frequency of clusters that have only one outbreak, and a high average number of years of defoliation per cluster compared to the theoretical ideal. Conversely, splitting occurs when we have too many clusters. Say that at our theoretical ideal number of clusters, cluster A has one outbreak spanning three years. We know that the center of defoliation does not stay in the same place within a cluster from year to year, and it is possible that if we increase the number of clusters, years 1 and 3 of the outbreak in cluster A will remain clustered together spatially, and year 2 of the outbreak in cluster A will be in its own cluster. Essentially, what is really a three-year outbreak that moves location from year to year has been "split" into three single-year outbreaks across two clusters at this new, higher clustering level. Looking across all clusters at this higher clustering level, we will again see a high frequency of clusters with only one outbreak, but there will now be a low average number of years of defoliation per cluster. Knowing how these two processes work allows us to define the theoretical ideal as the clustering level at which both splitting and merging are minimized. This would appear as the clustering level at which there is the lowest frequency of clusters with only one outbreak. To do this, we need to quantify the number of outbreaks in each cluster at each clustering level as well as the number of years of defoliation in each cluster at each level. The pipeline below produces a couple of summary data frames. The first frame has one entry for each cluster at each clustering level, and quantifies the number of outbreaks in that cluster and the number of years of defoliation in that cluster. The second has one entry for each unique number of outbreaks observed among the clusters at a given clustering level and quantifies the number and fraction of clusters at that given clustering level that have that many outbreaks. Similar to the second data frame, the third frame has one entry for each unique number of years of defoliation observed among the clusters at a given clustering level and quantifies the number and fraction of clusters at that clustering level that have that many years of defoliation.
+
+
+```{r}
+
+
+####summarizing and visualizing the frequencies of number of outbreaks observed in clusters across groups
+outbreak_summary <- defol_summary_complete_outbrkyrs %>%
+  group_by(lvl_M, CLUSTER_ID) %>%
+  summarise(n_outbreaks = length(which(yr_of_outbreak==1)), nyrs_defol = length(which(defol_total != 0))) %>%
+  ungroup() %>%
+  group_by(lvl_M) %>%
+  mutate(n_clust_revised = length(unique(CLUSTER_ID))) %>%
+  ungroup()
+
+
+
+outbreak_summary_2<-outbreak_summary %>%
+  group_by(lvl_M, n_clust_revised, n_outbreaks) %>%
+  summarise(nclust_w_noutbrks = n()) %>%
+  ungroup() %>%
+  mutate(pctclust_w_noutbrks = nclust_w_noutbrks/n_clust_revised)
+
+outbreak_summary_3<-outbreak_summary %>%
+  group_by(lvl_M, n_clust_revised, nyrs_defol) %>%
+  summarise(nclust_w_nyrs_defol = n()) %>%
+  ungroup() %>%
+  mutate(pctclust_w_nyrs_defol = nclust_w_nyrs_defol/n_clust_revised)
+
+
+```
+
+
+## Results
+
+The code below plots the metrics contained in the data frames produced by the above chunk as a function of clustering level and shows the proportions of clusters at each clustering level that have each unique value of the dependent variable.
+
+```{r}
+outbreak_summary_2 %>%
+  ggplot() +
+  aes(x=lvl_M, y = pctclust_w_noutbrks, fill = n_outbreaks) +
+  ggtitle("% of clusters with n outbreaks vs clustering level") +
+  xlab("Clustering Level") +
+  ylab("% of clusters") +
+  geom_bar(stat = "identity") +
+  scale_x_log10() +
+  scale_fill_viridis_c()
+
+outbreak_summary_3 %>%
+  ggplot() +
+  aes(x=lvl_M, y = pctclust_w_nyrs_defol, fill = nyrs_defol) +
+  ggtitle("% of clusters with n years of defoliation vs clustering level") +
+  xlab("Clustering Level") +
+  ylab("% of Clusters") +
+  geom_bar(stat = "identity", color = "white") +
+  scale_x_log10() +
+  scale_fill_viridis_c()
+```
+
+
+
+## References
+
+References:
+  Brookes, Martha H., et al. The Douglas-Fir Tussock Moth: A Synthesis. U.S. Dept. of Agriculture, 1978. 
+  
+  Shepherd, Roy F., et al. "Evidence of synchronized cycles in outbreak patterns of Douglas-fir tussock moth, Orgyia pseudotsugata (McDunnough)(Lepidoptera: Lymantriidae)." The Memoirs of the Entomological Society of Canada 120.S146 (1988): 107-121.
+  
+  Peltonen, Mikko, et al. "Spatial synchrony in forest insect outbreaks: roles of regional stochasticity and dispersal." Ecology 83.11 (2002): 3120-3129.
+
+
